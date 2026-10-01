@@ -15,7 +15,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
 
@@ -165,3 +165,137 @@ class PublishRequest(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# 多快照共享凭证申请的终态（语义与受控发布申请一致）
+BUNDLE_REQUEST_PENDING = "pending"
+BUNDLE_REQUEST_APPROVED = "approved"
+BUNDLE_REQUEST_REJECTED = "rejected"
+BUNDLE_REQUEST_STATUSES = (
+    BUNDLE_REQUEST_PENDING,
+    BUNDLE_REQUEST_APPROVED,
+    BUNDLE_REQUEST_REJECTED,
+)
+
+
+class ReadBundleRequest(Base):
+    """多快照共享凭证申请：operator 提交、另一名 reviewer 批准或驳回。
+
+    提交时冻结清单（snapshot_ids，JSONB 数组，保持提交顺序、互不重复）
+    与共享读取总额度、到期策略；批准时重新核对全部快照仍存在且未撤回，
+    任一项失效则整次批准失败，不签发凭证。
+    """
+
+    __tablename__ = "read_bundle_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected')",
+            name="ck_read_bundle_requests_status",
+        ),
+        CheckConstraint(
+            "jsonb_array_length(frozen_snapshot_ids) >= 2",
+            name="ck_read_bundle_requests_at_least_two",
+        ),
+        CheckConstraint(
+            "max_reads IS NOT NULL AND max_reads > 0",
+            name="ck_read_bundle_requests_max_reads_positive",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # 冻结的快照清单：JSONB 数组，元素为快照 UUID，提交时定形、此后不变
+    frozen_snapshot_ids: Mapped[list] = mapped_column(JSONB, nullable=False)
+
+    status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=BUNDLE_REQUEST_PENDING,
+        default=BUNDLE_REQUEST_PENDING,
+    )
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 凭证到期策略（提交时冻结）：相对时长在批准签发时才换算成绝对时刻
+    credential_expires_in_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    credential_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 全部清单快照共用的成功读取总额度（正整数，必填）
+    max_reads: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # 批准后同事务签发的凭证（驳回时保持为空）
+    bundle_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("read_bundles.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ReadBundle(Base):
+    """批准后一次性签发的多快照共享凭证：绑定冻结清单，共用读取额度。
+
+    凭证经现有公开快照读取接口使用：只能读取清单内快照的脱敏正文；
+    每次成功读取由 reads_used 共享计数，并发读取由条件 UPDATE 串行化，
+    成功次数绝不超过 max_reads。
+    """
+
+    __tablename__ = "read_bundles"
+    __table_args__ = (
+        CheckConstraint("max_reads > 0", name="ck_read_bundles_max_reads_positive"),
+        CheckConstraint("reads_used >= 0", name="ck_read_bundles_reads_used_non_negative"),
+        CheckConstraint(
+            "reads_used <= max_reads",
+            name="ck_read_bundles_reads_used_within_limit",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # 随机凭证字符串（secrets.token_urlsafe(32)），用于公开读取接口
+    credential: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    # 全部清单快照共用的成功读取总额度（正整数）
+    max_reads: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 已成功读取次数；由条件 UPDATE 原子递增，跨清单内所有快照共享
+    reads_used: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # 绑定的清单（批准时按冻结清单一次性写入），按提交顺序排列
+    items: Mapped[list["ReadBundleItem"]] = relationship(
+        back_populates="bundle", cascade="all, delete-orphan", order_by="ReadBundleItem.position"
+    )
+
+
+class ReadBundleItem(Base):
+    """共享凭证绑定的清单项：批准时按冻结清单一次性写入，此后不变。"""
+
+    __tablename__ = "read_bundle_items"
+    __table_args__ = (
+        UniqueConstraint("bundle_id", "snapshot_id", name="uq_read_bundle_items_bundle_snapshot"),
+        Index("ix_read_bundle_items_snapshot", "snapshot_id"),
+    )
+
+    bundle_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("read_bundles.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("snapshots.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # 提交顺序（从 0 开始），维护侧清单按此排序
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    bundle: Mapped["ReadBundle"] = relationship(back_populates="items")

@@ -9,6 +9,8 @@
 
 已发布版本若不应继续公开，机构可凭服务密钥将对应**快照永久撤回**：撤回只作用于该快照，同记录其他版本继续可读；撤回后无论持有该快照的哪枚令牌，新开始的公开读取一律沿用模糊 `403 snapshot unavailable` 且不消耗读取次数；该版本再次直接发布、提交受控申请或批准撤回前已在审的申请均返回 `409`，待审申请仍可驳回。
 
+此外，机构可把**多个已发布快照一次性交给同一外部审阅者**：operator 用本人凭据提交多快照共享凭证申请（**至少两个互不重复的快照 ID**、可选到期策略与**正整数共享读取总额度**，提交时冻结清单），由**另一名 reviewer** 批准或驳回（申请人不得自审）；批准时**重新核对全部快照仍存在且未撤回**，任一项失效则整次批准失败、不签发凭证（申请仍可驳回）。批准成功后**一次性签发随机共享凭证**，绑定冻结清单并**共用读取额度**：凭证在**现有公开快照读取接口**上只能读取清单内快照的脱敏正文，沿用原响应与模糊 403；清单内某项快照后来撤回，只拒绝该项且**不扣额度**，其他项仍可读；到期、撤销或额度耗尽时全部拒绝。维护人员凭服务密钥可查询凭证清单、额度与状态并撤销。
+
 签发快照读取令牌时可**可选**地设置正整数**读取次数上限**（`max_reads`）：直接发布在请求时确定，受控发布在提交申请时冻结、批准签发后生效。公开读取沿用既有脱敏正文响应，每次凭有效令牌**成功读取**消耗一次；无效、撤销、到期、快照已撤回、令牌与快照不匹配或已达上限的请求不消耗次数。
 
 - 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16
@@ -71,7 +73,15 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | `POST` | `/tokens/{token}/revoke` | 服务密钥 | 撤销读取令牌（含受控发布签发的令牌） |
 | `POST` | `/snapshots/{snapshot_id}/withdraw` | 服务密钥 | **永久撤回快照**（首次需带 `reason`）；重复撤回返回首次撤回时间与状态 |
 | `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含撤回时间、原因与状态） |
-| `GET` | `/public/snapshots/{snapshot_id}?token=...` | 无（凭令牌） | 公开读取脱敏正文 |
+| `POST` | `/bundle-requests` | operator | 提交多快照共享凭证申请：≥2 个互不重复快照 ID + 正整数 `max_reads`（可带到期策略），提交时冻结清单 |
+| `POST` | `/bundle-requests/{request_id}/approve` | reviewer（非申请人） | 批准：重新核对全部快照仍存在且未撤回，全部有效才一次性签发随机共享凭证 |
+| `POST` | `/bundle-requests/{request_id}/reject` | reviewer（非申请人） | 驳回共享凭证申请（可带 `reason`），终态，不签发凭证 |
+| `GET` | `/bundle-requests/{request_id}` | 任一已认证操作者 | 查询单个共享凭证申请（冻结清单与额度，不含原文） |
+| `GET` | `/bundle-requests` | 任一已认证操作者 | 列出全部共享凭证申请（不含原文） |
+| `GET` | `/read-bundles` | 服务密钥 | 列出全部已签发共享凭证：清单、额度、状态（不含原文） |
+| `GET` | `/read-bundles/{bundle_id}` | 服务密钥 | 查询单个共享凭证的清单、`max_reads`/`reads_used`/`remaining_reads` 与状态 |
+| `POST` | `/read-bundles/{bundle_id}/revoke` | 服务密钥 | 撤销共享凭证（撤销后全部读取 403） |
+| `GET` | `/public/snapshots/{snapshot_id}?token=...` | 无（凭令牌或共享凭证） | 公开读取脱敏正文（单快照令牌与多快照共享凭证同一入口） |
 | `GET` | `/healthz` | 无 | 健康检查 |
 
 ### 区间语义
@@ -266,6 +276,97 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
 | 未知记录 / 版本 / 申请 | `404` |
 | 受控记录直接发布、非受控记录提交申请、对已终结申请再操作、提交/批准命中已撤回版本、令牌到期时间非法 | `409` / `422` |
 
+## 多快照共享凭证（一次把多个快照交给同一外部审阅者）
+
+机构需要把**多个已发布快照**交给同一名外部审阅者时，可申请一枚**跨快照共享凭证**：凭证仍在**现有公开读取接口** `GET /public/snapshots/{snapshot_id}?token=...` 使用，但只能读取**申请清单内**快照的脱敏正文，且所有成功读取**共用同一读取额度**。快照不要求来自受控发布——任何已存在且未撤回的快照都可入单。
+
+### 流程与规则
+
+1. **提交（operator）**：`POST /bundle-requests`，用申请人本人 Basic 凭据，请求体：
+   - `snapshot_ids`：**至少两个、互不重复**的快照 ID（顺序即冻结清单顺序）；
+   - `max_reads`：**正整数**共享成功读取**总额度**（必填，清单内所有快照共用）；
+   - 可选 `expires_in_seconds` / `expires_at`（二选一，规则与令牌到期一致；不传则永不到期）。
+
+   提交时即**冻结清单**：未知快照 → `404`，含已撤回快照 → `409`，少于两个/重复/额度非正整数 → `422`。
+2. **复核（另一名 reviewer）**：
+   - 申请人**不得自审**（即使同时具备 reviewer 角色）→ `403`；
+   - 批准时**重新核对冻结清单的全部快照仍存在且未撤回**（对快照行加锁，与撤回串行化），**任一项失效则整次批准失败** → `409`，**不签发凭证**，申请保持待审、**仍可驳回**；
+   - 批准与驳回互斥、终态唯一，并发复核由申请行行锁串行化（落选方 `409`）。
+3. **一次性签发**：批准成功在**同一事务**内生成随机凭证（`secrets.token_urlsafe(32)`）、写入绑定的冻结清单并终结申请；任一步失败整体回滚。响应返回 `bundle_id`、`credential`、冻结 `snapshot_ids`、`expires_at` 与 `max_reads`。
+4. **公开读取**：`GET /public/snapshots/{snapshot_id}?token=<共享凭证>`——与单快照令牌**同一入口、同一响应结构、同一模糊 `403 snapshot unavailable`**：
+   - 凭证只能读取**清单内**快照；读取清单外快照（含快照不存在）→ `403`，不扣额度；
+   - 每次**成功**读取扣一次**共享**额度（`reads_used` 跨清单累计，只增不减）；并发读取由同一条条件 `UPDATE` 原子判定并递增，成功总次数绝不超过 `max_reads`；
+   - 清单内**某项快照后来撤回**：只拒绝该项（快照行锁阶段即 403），**不扣额度**，其他项仍可凭同一凭证读取；
+   - **到期、撤销或额度耗尽**时，清单内全部快照一律 `403`；这些失败请求都不消耗额度。
+5. **维护侧（服务密钥）**：`GET /read-bundles` 与 `GET /read-bundles/{bundle_id}` 返回凭证清单（每项含 `snapshot_id`、`record_id`、`version`、`position` 与当前 `status`/`withdrawn_at`）、`max_reads` / `reads_used` / `remaining_reads` / `active` 与到期、撤销时间，**不含任何原文**；`POST /read-bundles/{bundle_id}/revoke` 撤销凭证（幂等），撤销提交后新开始的读取全部 `403`。
+6. **与既有能力兼容**：原有单快照令牌的读取、计数、查询（`/tokens/{token}`）、撤销与受控/直接发布接口的行为与响应**保持不变**；共享凭证是独立命名空间，不会出现在 `/tokens` 中，单快照令牌也不受共享额度影响。
+
+### 调用示例
+
+```bash
+# 1. operator（alice）提交：冻结两个已发布快照 + 共享总额度 5（可另加 expires_in_seconds/expires_at）
+curl -sS -X POST http://localhost:8000/bundle-requests \
+  -u alice:alice-pw -H "Content-Type: application/json" \
+  -d '{"snapshot_ids": ["<SID1>", "<SID2>"], "max_reads": 5}'
+# => {"request_id":"<BRID>","status":"pending","snapshot_ids":["<SID1>","<SID2>"],
+#     "requested_by":"alice","max_reads":5,"created_at":"..."}
+
+# 申请详情：冻结清单与额度（不含原文）
+curl -sS http://localhost:8000/bundle-requests/<BRID> -u alice:alice-pw
+
+# 2. 申请人不得自审
+curl -sS -X POST http://localhost:8000/bundle-requests/<BRID>/approve -u alice:alice-pw
+# => 403 {"detail":"the requester may not review their own bundle request"}
+
+# 3. 另一人 bob（reviewer）批准：重新核对清单全部有效后一次性签发凭证
+curl -sS -X POST http://localhost:8000/bundle-requests/<BRID>/approve -u bob:bob-pw
+# => {"request_id":"<BRID>","status":"approved","reviewed_by":"bob",
+#     "bundle_id":"<BID>","credential":"<CRED>","snapshot_ids":["<SID1>","<SID2>"],
+#     "expires_at":null,"max_reads":5}
+
+# 4. 凭凭证在既有公开接口读取清单内脱敏正文（两个快照共用 5 次额度）
+curl -sS "http://localhost:8000/public/snapshots/<SID1>?token=<CRED>"
+# => {"record_id":"<RID1>","version":1,"status":"published","redacted_text":"……"}
+curl -sS "http://localhost:8000/public/snapshots/<SID2>?token=<CRED>"
+# 清单外快照（或不存在）=> 403 {"detail":"snapshot unavailable"}，不扣额度
+
+# 5. 维护侧查询清单、额度与状态（不含原文）
+curl -sS http://localhost:8000/read-bundles/<BID> -H "X-Service-Key: dev-service-key-change-me"
+# => {"bundle_id":"<BID>","credential":"<CRED>","max_reads":5,"reads_used":2,
+#     "remaining_reads":3,"active":true,"expires_at":null,"revoked_at":null,
+#     "items":[{"snapshot_id":"<SID1>","record_id":"...","version":1,"position":0,
+#               "status":"published","withdrawn_at":null}, ...]}
+
+# 6. 清单中某项快照撤回：只拒绝该项、不扣额度，其他项仍可读
+curl -sS -X POST http://localhost:8000/snapshots/<SID2>/withdraw \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"reason":"该版本不再对外提供"}'
+curl -sS "http://localhost:8000/public/snapshots/<SID2>?token=<CRED>"   # => 403 snapshot unavailable（不扣额度）
+curl -sS "http://localhost:8000/public/snapshots/<SID1>?token=<CRED>"   # => 200（继续可读）
+
+# 7. 撤销共享凭证（撤销后全部 403）；驳回/终态与受控发布语义一致
+curl -sS -X POST http://localhost:8000/read-bundles/<BID>/revoke \
+  -H "X-Service-Key: dev-service-key-change-me"
+```
+
+完整端到端演示（含 401/403/404/409/422、申请人回避、批准时清单失效整次失败仍可驳回、清单外读取不扣额度、撤回单项不扣额度、共用额度耗尽与并发不越限、到期与撤销、维护侧查询）：
+
+```bash
+./examples/demo_bundles.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW / CAROL_PW 覆盖
+```
+
+### 状态码约定（共享凭证接口）
+
+| 场景 | 状态码 |
+| --- | --- |
+| 缺少/错误 Basic 凭据 | `401`（带 `WWW-Authenticate: Basic`） |
+| 已认证但缺少 operator/reviewer 角色 | `403` |
+| 申请人复核自己的申请 | `403` |
+| 提交含未知快照；未知申请；维护侧查询未知凭证 | `404` |
+| 提交/批准命中已撤回快照（批准时任一项失效）、对已终结申请再操作 | `409` |
+| 清单少于两个、含重复 ID、`max_reads` 非正整数、到期时间非法、两种到期方式同传 | `422` |
+| 凭证读取清单外快照、凭证无效/撤销/到期/额度耗尽、快照已撤回 | 公开侧统一 `403 snapshot unavailable` |
+
 ## 设计要点
 
 - **不可变快照**：发布时把脱敏结果写入 `snapshots`（按 `(record_id, version)` 唯一），公开读取只访问快照；后续修订写入新版本，旧快照不变。
@@ -289,6 +390,13 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
   - 批准时**快照、新令牌、申请终态在同一事务提交**，任一异常整体回滚，不会留下无主或可读令牌；驳回不产生快照/令牌；
   - 个人凭据（HTTP Basic）与机构服务密钥（`X-Service-Key`）分离，角色为 `operator`/`reviewer`，申请人与复核人身份按用户名强制不同；
   - 既有数据库升级时启动会幂等补列 `records.controlled`（旧记录默认非受控）、`read_tokens.max_reads`/`reads_used`（既有令牌 `max_reads` 为空即继续不限次、已用为 0）、`publish_requests.token_max_reads` 与 `snapshots.withdrawn_at`/`withdraw_reason`（既有快照默认未撤回、继续可读），新表随 `create_all` 幂等创建。
+- **多快照共享凭证**：
+  - 新表 `read_bundle_requests`（冻结清单 `frozen_snapshot_ids`、共享 `max_reads`、到期策略、申请/复核人与终态）、`read_bundles`（随机 `credential`、共享 `max_reads`/`reads_used`、到期与撤销）与 `read_bundle_items`（凭证-快照绑定与提交顺序）随 `create_all` 幂等创建，不改动既有表；
+  - 清单在**提交时冻结**为 JSONB 快照 ID 数组（去重保序，至少 2 项，附 `jsonb_array_length >= 2` 与额度正整数检查约束）；批准时对全部快照行 `SELECT ... FOR UPDATE` **重新核对**仍存在且未撤回，任一失效即回滚本次批准、申请保持待审（仍可驳回）；
+  - 凭证、清单项与申请终态在**同一事务**提交，随机凭证一次性签发；驳回不产生凭证；
+  - 公开读取沿用快照行锁先判定撤回，再把“凭证有效 + 快照在清单内（`EXISTS` 子查询命中 `read_bundle_items`）+ 未撤销 + 未到期 + `reads_used < max_reads`”与共享计数递增合并为**同一条条件 `UPDATE`**：行锁串行化跨快照并发读取，成功总次数绝不超过共享上限；清单外/失效/到期/撤销/耗尽均不命中因而不扣额度，统一模糊 `403`；
+  - 清单内某快照撤回只在该快照的行锁阶段拒绝该项、不触碰共享计数，其他清单项不受影响；撤销凭证是独立的原子条件 `UPDATE`，提交后优先生效；
+  - 共享凭证与单快照令牌是**两套独立计数与命名空间**：公开接口先按单快照令牌原子判定，未命中再按共享凭证判定，故既有令牌的响应、计数与 `/tokens` 查询行为完全不变。
 
 ## 本地开发
 
@@ -313,10 +421,10 @@ python3 -m unittest tests.test_integration_api -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（受控发布申请-复核、令牌读取次数计数与查询、快照永久撤回）
-  models.py     # records / record_versions / snapshots(含撤回字段) / read_tokens(含 max_reads/reads_used) / publish_requests
+  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、多快照共享凭证申请-复核与共用额度）
+  models.py     # records / record_versions / snapshots(含撤回字段) / read_tokens / publish_requests / read_bundles(+requests/items)
   redaction.py  # 区间校验、合并、替换（纯函数）
-  schemas.py    # 请求/响应模型（含撤回请求/响应、max_reads 与令牌状态响应）
+  schemas.py    # 请求/响应模型（含撤回、max_reads 与多快照共享凭证模型）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
   config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验）
   db.py         # 引擎与会话
@@ -324,9 +432,10 @@ examples/
   demo.sh             # 直接发布端到端调用示例
   demo_controlled.sh  # 受控发布（申请-复核）端到端调用示例
   demo_withdraw.sh    # 快照永久撤回端到端调用示例
+  demo_bundles.sh     # 多快照共享凭证（申请-复核 + 共用额度）端到端调用示例
 tests/
   test_redaction.py       # 脱敏逻辑单元测试
   test_config.py          # 操作者凭据配置校验单元测试
-  test_integration_api.py # 受控/既有接口端到端集成测试（真实 PostgreSQL）
+  test_integration_api.py # 受控/共享凭证/既有接口端到端集成测试（真实 PostgreSQL）
 Dockerfile / docker-compose.yml
 ```

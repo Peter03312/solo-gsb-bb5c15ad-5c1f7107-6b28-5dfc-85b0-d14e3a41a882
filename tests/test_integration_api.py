@@ -1107,5 +1107,487 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
             self.assertEqual(row.withdraw_reason, "误发，撤回")
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class ReadBundleIntegrationTests(unittest.TestCase):
+    """多快照共享凭证：申请-复核、冻结清单、共用额度、撤回单项、维护侧管理。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        # 每个用例准备两条已发布记录/快照（直接发布即可，快照不要求来自受控发布）
+        self.snapshot_ids = []
+        self.redacted_texts = []
+        for idx, (text_, intervals) in enumerate(
+            (
+                (TEXT_V1, INTERVALS_V1),
+                (TEXT_V2, [{"start": 9, "end": 15}]),
+            )
+        ):
+            r = self.client.post(
+                "/records",
+                headers=SERVICE_HEADERS,
+                json={"text": text_, "intervals": intervals},
+            )
+            self.assertEqual(r.status_code, 201, r.text)
+            record_id = r.json()["record_id"]
+            r = self.client.post(
+                f"/records/{record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1, "max_reads": 100},
+            )
+            self.assertEqual(r.status_code, 201, r.text)
+            self.snapshot_ids.append(r.json()["snapshot_id"])
+            r = self.client.get(
+                f"/public/snapshots/{self.snapshot_ids[-1]}?token={r.json()['token']}"
+            )
+            self.redacted_texts.append(r.json()["redacted_text"])
+
+    # ---- 工具方法 ----
+
+    def _submit(self, snapshot_ids=None, max_reads=10, auth=BASIC_ALICE, expected=201, extra=None):
+        body = {
+            "snapshot_ids": snapshot_ids if snapshot_ids is not None else self.snapshot_ids,
+            "max_reads": max_reads,
+        }
+        if extra:
+            body.update(extra)
+        r = self.client.post("/bundle-requests", auth=auth, json=body)
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _approve(self, request_id, auth=BASIC_BOB, expected=200):
+        r = self.client.post(f"/bundle-requests/{request_id}/approve", auth=auth)
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _approved_bundle(self, max_reads=10, extra=None):
+        submit = self._submit(max_reads=max_reads, extra=extra).json()
+        approve = self._approve(submit["request_id"]).json()
+        self.assertEqual(approve["status"], "approved")
+        self.assertEqual(approve["snapshot_ids"], self.snapshot_ids)
+        return approve
+
+    def _read(self, snapshot_id, credential, expected=200):
+        r = self.client.get(f"/public/snapshots/{snapshot_id}?token={credential}")
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    # ---- 提交校验与鉴权 ----
+
+    def test_submit_requires_operator_role_and_valid_credentials(self):
+        r = self.client.post(
+            "/bundle-requests",
+            json={"snapshot_ids": self.snapshot_ids, "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("Basic", r.headers["WWW-Authenticate"])
+        # bob 只有 reviewer 角色，不能提交
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_BOB,
+            json={"snapshot_ids": self.snapshot_ids, "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 403)
+        # 错误口令 401
+        r = self.client.post(
+            "/bundle-requests",
+            auth=("alice", "wrong"),
+            json={"snapshot_ids": self.snapshot_ids, "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_submit_requires_at_least_two_distinct_ids_and_positive_cap(self):
+        # 少于两个
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [self.snapshot_ids[0]], "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 422)
+        # 重复 ID
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [self.snapshot_ids[0], self.snapshot_ids[0]], "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 422)
+        # 额度非正整数
+        for bad in (0, -1):
+            r = self.client.post(
+                "/bundle-requests",
+                auth=BASIC_ALICE,
+                json={"snapshot_ids": self.snapshot_ids, "max_reads": bad},
+            )
+            self.assertEqual(r.status_code, 422)
+
+    def test_submit_unknown_snapshot_404_and_withdrawn_409(self):
+        import uuid
+
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [self.snapshot_ids[0], str(uuid.uuid4())], "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 404, r.text)
+        # 撤回其中一个快照后提交 -> 409
+        r = self.client.post(
+            f"/snapshots/{self.snapshot_ids[1]}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "不应公开"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": self.snapshot_ids, "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_submit_freezes_list_and_cap(self):
+        r = self._submit(max_reads=4, extra={"expires_in_seconds": 3600})
+        body = r.json()
+        self.assertEqual(body["snapshot_ids"], self.snapshot_ids)
+        self.assertEqual(body["max_reads"], 4)
+        self.assertEqual(body["status"], "pending")
+        detail = self.client.get(
+            f"/bundle-requests/{body['request_id']}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(detail["snapshot_ids"], self.snapshot_ids)
+        self.assertEqual(detail["max_reads"], 4)
+        self.assertEqual(detail["credential_expires_in_seconds"], 3600)
+        self.assertIsNone(detail["bundle_id"])
+        # 详情不含原文
+        self.assertNotIn(TEXT_V1, str(detail))
+
+    def test_submit_expiry_policy_validation(self):
+        from datetime import datetime, timezone
+
+        past = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
+        r = self._submit(extra={"expires_at": past}, expected=422)
+        self.assertNotIn(TEXT_V1, r.text)
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={
+                "snapshot_ids": self.snapshot_ids,
+                "max_reads": 3,
+                "expires_in_seconds": 60,
+                "expires_at": datetime(2099, 1, 1, tzinfo=timezone.utc).isoformat(),
+            },
+        )
+        self.assertEqual(r.status_code, 422)
+
+    # ---- 复核规则 ----
+
+    def test_reviewer_role_required_and_requester_cannot_self_review(self):
+        submit = self._submit().json()
+        rid = submit["request_id"]
+        # alice 只有 operator 角色 -> 403
+        r = self.client.post(f"/bundle-requests/{rid}/approve", auth=BASIC_ALICE)
+        self.assertEqual(r.status_code, 403)
+        # carol 虽是 reviewer 但是申请人本人 -> 403（申请人不得自审）
+        submit2 = self._submit(auth=BASIC_CAROL).json()
+        r = self.client.post(f"/bundle-requests/{submit2['request_id']}/approve", auth=BASIC_CAROL)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("may not review their own", r.json()["detail"])
+        # bob（非申请人）批准成功
+        self.assertEqual(self._approve(rid).status_code, 200)
+
+    def test_unknown_request_404(self):
+        import uuid
+
+        r = self.client.post(f"/bundle-requests/{uuid.uuid4()}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 404)
+        r = self.client.post(
+            f"/bundle-requests/{uuid.uuid4()}/reject",
+            auth=BASIC_BOB,
+            json={},
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_reject_is_terminal_and_approves_once(self):
+        # 驳回
+        submit = self._submit().json()
+        rid = submit["request_id"]
+        r = self.client.post(
+            f"/bundle-requests/{rid}/reject", auth=BASIC_BOB, json={"reason": "材料不足"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+        self.assertEqual(r.json()["reviewed_by"], "bob")
+        self.assertEqual(r.json()["reason"], "材料不足")
+        # 驳回后不能批准/再驳回
+        self.assertEqual(self._approve(rid, expected=409).status_code, 409)
+        r = self.client.post(f"/bundle-requests/{rid}/reject", auth=BASIC_BOB, json={})
+        self.assertEqual(r.status_code, 409)
+        # 批准终态同样唯一
+        submit2 = self._submit().json()
+        rid2 = submit2["request_id"]
+        self.assertEqual(self._approve(rid2).status_code, 200)
+        r = self.client.post(f"/bundle-requests/{rid2}/reject", auth=BASIC_BOB, json={})
+        self.assertEqual(r.status_code, 409)
+
+    # ---- 批准时重新核对冻结清单 ----
+
+    def test_approval_fails_if_any_snapshot_withdrawn_after_submission(self):
+        submit = self._submit(max_reads=5).json()
+        rid = submit["request_id"]
+        # 等待复核期间撤回其中一个快照
+        r = self.client.post(
+            f"/snapshots/{self.snapshot_ids[1]}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "等待期间撤回"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 整次批准失败，不签发凭证
+        r = self.client.post(f"/bundle-requests/{rid}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 409, r.text)
+        detail = self.client.get(f"/bundle-requests/{rid}", auth=BASIC_ALICE).json()
+        self.assertEqual(detail["status"], "pending")
+        self.assertIsNone(detail["bundle_id"])
+        # 申请仍可驳回
+        r = self.client.post(f"/bundle-requests/{rid}/reject", auth=BASIC_BOB, json={})
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_approval_creates_credential_bound_to_list_in_one_transaction(self):
+        approve = self._approved_bundle(max_reads=6)
+        bundle_id, credential = approve["bundle_id"], approve["credential"]
+        # 维护侧查询：清单、额度、状态
+        status_body = self.client.get(
+            f"/read-bundles/{bundle_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["max_reads"], 6)
+        self.assertEqual(status_body["reads_used"], 0)
+        self.assertEqual(status_body["remaining_reads"], 6)
+        self.assertTrue(status_body["active"])
+        items = status_body["items"]
+        self.assertEqual([i["snapshot_id"] for i in items], self.snapshot_ids)
+        self.assertEqual([i["position"] for i in items], [0, 1])
+        self.assertTrue(all(i["status"] == "published" for i in items))
+        self.assertNotIn(TEXT_V1, str(status_body))
+        # 未知凭证 404，缺服务密钥 401
+        import uuid
+
+        self.assertEqual(
+            self.client.get(f"/read-bundles/{uuid.uuid4()}", headers=SERVICE_HEADERS).status_code,
+            404,
+        )
+        self.assertEqual(self.client.get(f"/read-bundles/{bundle_id}").status_code, 401)
+
+    # ---- 公开读取：共用额度 ----
+
+    def test_credential_reads_only_listed_snapshots_and_shares_cap(self):
+        approve = self._approved_bundle(max_reads=3)
+        cred = approve["credential"]
+        # 清单内两项都可读，返回脱敏正文
+        self.assertEqual(
+            self._read(self.snapshot_ids[0], cred).json()["redacted_text"],
+            self.redacted_texts[0],
+        )
+        self.assertEqual(
+            self._read(self.snapshot_ids[1], cred).json()["redacted_text"],
+            self.redacted_texts[1],
+        )
+        # 第 3 次成功，之后跨任一清单快照全部 403（共用额度）
+        self.assertEqual(self._read(self.snapshot_ids[0], cred).status_code, 200)
+        for sid in self.snapshot_ids:
+            r = self._read(sid, cred, expected=403)
+            self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        status_body = self.client.get(
+            f"/read-bundles/{approve['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 3)
+        self.assertEqual(status_body["remaining_reads"], 0)
+        self.assertFalse(status_body["active"])
+
+    def test_credential_cannot_read_snapshot_outside_list(self):
+        # 第三个快照：发布到一条新记录
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "第三条记录，秘密XYZ。", "intervals": [{"start": 6, "end": 12}]},
+        )
+        rid = r.json()["record_id"]
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json={"version": 1}
+        )
+        other_sid = r.json()["snapshot_id"]
+        approve = self._approved_bundle(max_reads=3)
+        cred = approve["credential"]
+        # 不在清单内 -> 模糊 403，不扣额度
+        self._read(other_sid, cred, expected=403)
+        status_body = self.client.get(
+            f"/read-bundles/{approve['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 0)
+        self.assertTrue(status_body["active"])
+        # 未知快照 + 凭证也统一 403
+        import uuid
+
+        self._read(uuid.uuid4(), cred, expected=403)
+
+    def test_withdrawn_listed_item_rejected_without_consuming_others_remain_readable(self):
+        approve = self._approved_bundle(max_reads=3)
+        cred = approve["credential"]
+        # 撤回清单中的第二项
+        r = self.client.post(
+            f"/snapshots/{self.snapshot_ids[1]}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "该项撤回"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 该项一律 403，且不扣额度
+        self._read(self.snapshot_ids[1], cred, expected=403)
+        self._read(self.snapshot_ids[1], cred, expected=403)
+        # 第一项仍可读；额度仍为 3，读一次后剩 2
+        self._read(self.snapshot_ids[0], cred, expected=200)
+        status_body = self.client.get(
+            f"/read-bundles/{approve['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 1)
+        self.assertEqual(status_body["remaining_reads"], 2)
+        self.assertEqual(status_body["items"][1]["status"], "withdrawn")
+        self.assertIsNotNone(status_body["items"][1]["withdrawn_at"])
+        # 模糊 403 不透露撤回原因
+        r = self._read(self.snapshot_ids[1], cred, expected=403)
+        self.assertNotIn("该项撤回", r.text)
+
+    def test_invalid_or_expired_or_revoked_credential_does_not_consume(self):
+        # 无效凭证
+        self._read(self.snapshot_ids[0], "not-a-real-credential", expected=403)
+        approve = self._approved_bundle(max_reads=2)
+        bid, cred = approve["bundle_id"], approve["credential"]
+        # 撤销：撤销后全部拒绝
+        r = self.client.post(f"/read-bundles/{bid}/revoke", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["revoked"])
+        self.assertFalse(r.json()["already_revoked"])
+        for sid in self.snapshot_ids:
+            self._read(sid, cred, expected=403)
+        status_body = self.client.get(
+            f"/read-bundles/{bid}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 0)
+        self.assertFalse(status_body["active"])
+        self.assertIsNotNone(status_body["revoked_at"])
+        # 重复撤销幂等
+        r = self.client.post(f"/read-bundles/{bid}/revoke", headers=SERVICE_HEADERS)
+        self.assertTrue(r.json()["already_revoked"])
+        # 撤销未知凭证 404
+        import uuid
+
+        self.assertEqual(
+            self.client.post(
+                f"/read-bundles/{uuid.uuid4()}/revoke", headers=SERVICE_HEADERS
+            ).status_code,
+            404,
+        )
+
+    def test_expired_credential_rejects_all_without_consuming(self):
+        approve = self._approved_bundle(max_reads=3, extra={"expires_in_seconds": 1})
+        cred = approve["credential"]
+        self._read(self.snapshot_ids[0], cred, expected=200)
+        import time as _time
+
+        _time.sleep(1.2)
+        for sid in self.snapshot_ids:
+            self._read(sid, cred, expected=403)
+        status_body = self.client.get(
+            f"/read-bundles/{approve['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 1)
+        self.assertFalse(status_body["active"])
+
+    def test_concurrent_reads_never_exceed_shared_cap(self):
+        approve = self._approved_bundle(max_reads=10)
+        cred = approve["credential"]
+        successes: list[int] = []
+        failures: list[int] = []
+        barrier = threading.Barrier(24)
+
+        def read_once(i):
+            barrier.wait()
+            client = TestClient(app_main.app)
+            # 交替读取两个清单快照，验证共用额度
+            sid = self.snapshot_ids[i % 2]
+            code = client.get(f"/public/snapshots/{sid}?token={cred}").status_code
+            (successes if code == 200 else failures).append(code)
+
+        threads = [threading.Thread(target=read_once, args=(i,)) for i in range(24)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(successes), 10, successes + failures)
+        self.assertEqual(len(failures), 14)
+        self.assertTrue(all(code == 403 for code in failures))
+        status_body = self.client.get(
+            f"/read-bundles/{approve['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 10)
+        self.assertEqual(status_body["remaining_reads"], 0)
+
+    # ---- 维护侧与兼容性 ----
+
+    def test_maintenance_lists_and_legacy_token_unchanged(self):
+        approve = self._approved_bundle(max_reads=2)
+        cred = approve["credential"]
+        # 列表接口
+        r = self.client.get("/read-bundles", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(any(b["bundle_id"] == approve["bundle_id"] for b in r.json()["bundles"]))
+        # 申请列表（操作者可查）
+        r = self.client.get("/bundle-requests", auth=BASIC_ALICE)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(
+            any(q["request_id"] == approve["request_id"] for q in r.json()["requests"])
+        )
+        # 共享凭证不在既有单快照令牌命名空间：/tokens/<credential> 仍 404（接口行为兼容）
+        self.assertEqual(
+            self.client.get(f"/tokens/{cred}", headers=SERVICE_HEADERS).status_code, 404
+        )
+        # 既有单快照令牌行为不变：为快照 0 再签一枚既有令牌（同版本复用快照），
+        # 其计数与共享凭证互不影响
+        record_id = self._record_of_snapshot(self.snapshot_ids[0])
+        pub = self.client.post(
+            f"/records/{record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1, "max_reads": 1},
+        )
+        self.assertEqual(pub.status_code, 201, pub.text)
+        legacy_token = pub.json()["token"]
+        self.assertEqual(
+            self._read(self.snapshot_ids[0], legacy_token).status_code, 200
+        )
+        self.assertEqual(
+            self._read(self.snapshot_ids[0], legacy_token, expected=403).status_code, 403
+        )
+        # 共享凭证额度未被原令牌消耗
+        status_body = self.client.get(
+            f"/read-bundles/{approve['bundle_id']}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(status_body["reads_used"], 0)
+        # 公开读取统一响应结构未变
+        body = self._read(self.snapshot_ids[0], cred).json()
+        self.assertEqual(set(body.keys()), {"record_id", "version", "status", "redacted_text"})
+
+    def _record_of_snapshot(self, snapshot_id):
+        # 通过共享凭证读取响应无法拿 record（避免耦合），改用维护侧记录检索：
+        # 直接从快照行查询其 record_id
+        from app.db import SessionLocal
+        from app.models import Snapshot as SnapshotModel
+
+        with SessionLocal() as session:
+            return session.get(SnapshotModel, snapshot_id).record_id
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,15 +8,21 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import func, inspect, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from .config import settings
 from .db import Base, engine, get_db
 from .models import (
+    BUNDLE_REQUEST_APPROVED,
+    BUNDLE_REQUEST_PENDING,
+    BUNDLE_REQUEST_REJECTED,
     REQUEST_APPROVED,
     REQUEST_PENDING,
     REQUEST_REJECTED,
     PublishRequest as PublishRequestModel,
+    ReadBundle,
+    ReadBundleItem,
+    ReadBundleRequest,
     ReadToken,
     Record,
     RecordVersion,
@@ -25,6 +31,13 @@ from .models import (
 from .redaction import IntervalOutOfBoundsError, redact_text, validate_intervals
 from .schemas import (
     ApproveResponse,
+    BundleApproveResponse,
+    BundleItemInfo,
+    BundleRequestCreate,
+    BundleRequestInfo,
+    BundleRequestListResponse,
+    BundleRevokeResponse,
+    BundleSubmitResponse,
     ControlledFlagResponse,
     ControlledPublishRequest,
     ControlledSubmitResponse,
@@ -34,6 +47,8 @@ from .schemas import (
     PublishRequestInfo,
     PublishRequestListResponse,
     PublishResponse,
+    ReadBundleListResponse,
+    ReadBundleStatusResponse,
     RecordCreateRequest,
     RecordResponse,
     RecordReviseRequest,
@@ -137,8 +152,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.3.0",
-    summary="机构公开脱敏记录服务（受控发布申请-复核 + 读取次数上限 + 快照永久撤回）",
+    version="1.4.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证）",
     lifespan=lifespan,
 )
 
@@ -207,6 +222,63 @@ def _validate_expiry_policy(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="expires_at must be in the future",
         )
+
+
+def _bundle_request_info(request: ReadBundleRequest) -> BundleRequestInfo:
+    """共享凭证申请详情映射：只输出元数据，快照原文绝不离开服务端。"""
+    return BundleRequestInfo(
+        request_id=request.id,
+        status=request.status,
+        snapshot_ids=[UUID(sid) for sid in request.frozen_snapshot_ids],
+        requested_by=request.requested_by,
+        reviewed_by=request.reviewed_by,
+        reason=request.reason,
+        credential_expires_in_seconds=request.credential_expires_in_seconds,
+        credential_expires_at=request.credential_expires_at,
+        max_reads=request.max_reads,
+        bundle_id=request.bundle_id,
+        created_at=request.created_at,
+        decided_at=request.decided_at,
+    )
+
+
+def _bundle_active(bundle: ReadBundle, now: datetime) -> bool:
+    """凭证是否仍可成功读取：未撤销、未到期且共享额度未耗尽。"""
+    if bundle.revoked_at is not None:
+        return False
+    if bundle.expires_at is not None and bundle.expires_at <= now:
+        return False
+    return bundle.reads_used < bundle.max_reads
+
+
+def _bundle_status_response(
+    bundle: ReadBundle, snapshots: dict[UUID, Snapshot]
+) -> ReadBundleStatusResponse:
+    """维护侧凭证状态映射：清单按提交顺序排列，绝不返回快照原文。"""
+    now = datetime.now(timezone.utc)
+    items = [
+        BundleItemInfo(
+            snapshot_id=item.snapshot_id,
+            record_id=snapshots[item.snapshot_id].record_id,
+            version=snapshots[item.snapshot_id].version,
+            position=item.position,
+            status=_snapshot_status(snapshots[item.snapshot_id]),
+            withdrawn_at=snapshots[item.snapshot_id].withdrawn_at,
+        )
+        for item in sorted(bundle.items, key=lambda item: item.position)
+    ]
+    return ReadBundleStatusResponse(
+        bundle_id=bundle.id,
+        credential=bundle.credential,
+        max_reads=bundle.max_reads,
+        reads_used=bundle.reads_used,
+        remaining_reads=max(bundle.max_reads - bundle.reads_used, 0),
+        active=_bundle_active(bundle, now),
+        created_at=bundle.created_at,
+        expires_at=bundle.expires_at,
+        revoked_at=bundle.revoked_at,
+        items=items,
+    )
 
 
 @app.get("/healthz")
@@ -615,6 +687,331 @@ def list_publish_requests(
     )
 
 
+# ---- 多快照共享凭证（read bundle）：申请-复核 + 共用读取额度 ----
+
+
+@app.post(
+    "/bundle-requests",
+    status_code=status.HTTP_201_CREATED,
+    response_model=BundleSubmitResponse,
+)
+def submit_bundle_request(
+    payload: BundleRequestCreate,
+    operator: Operator = Depends(require_role("operator")),
+    db: Session = Depends(get_db),
+):
+    """提交多快照共享凭证申请：冻结清单、可选到期策略与正整数共享总额度。
+
+    清单在提交时定形：至少两个互不重复的快照 ID，且全部为已存在且未撤回
+    的快照；未知快照 404、已撤回快照 409。批准时会再次重新核对全部快照。
+    """
+    snapshot_ids = list(dict.fromkeys(payload.snapshot_ids))  # 去重保序（重复已在 schema 拒绝）
+    snapshots = (
+        db.execute(select(Snapshot).where(Snapshot.id.in_(snapshot_ids)))
+        .scalars()
+        .all()
+    )
+    by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    missing = [sid for sid in snapshot_ids if sid not in by_id]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    withdrawn = [sid for sid in snapshot_ids if by_id[sid].withdrawn_at is not None]
+    if withdrawn:
+        # 已撤回快照不能进入共享凭证；批准时还会重新核对
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="one or more snapshots have been withdrawn",
+        )
+    _validate_expiry_policy(payload.expires_in_seconds, payload.expires_at)
+    expires_at = payload.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    # 清单在此冻结：JSONB 以字符串数组存放 UUID，之后快照撤回等变化不改变本申请清单
+    request = ReadBundleRequest(
+        frozen_snapshot_ids=[str(sid) for sid in snapshot_ids],
+        status=BUNDLE_REQUEST_PENDING,
+        requested_by=operator.username,
+        credential_expires_in_seconds=payload.expires_in_seconds,
+        credential_expires_at=expires_at,
+        max_reads=payload.max_reads,
+    )
+    db.add(request)
+    db.commit()
+    return BundleSubmitResponse(
+        request_id=request.id,
+        status=request.status,
+        snapshot_ids=snapshot_ids,
+        requested_by=request.requested_by,
+        max_reads=request.max_reads,
+        created_at=request.created_at,
+    )
+
+
+@app.post(
+    "/bundle-requests/{request_id}/approve",
+    response_model=BundleApproveResponse,
+)
+def approve_bundle_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """批准共享凭证申请：重新核对冻结清单全部快照，全部有效才一次性签发凭证。
+
+    - 申请人不得复核自己的申请 -> 403；
+    - 已终态的申请再次操作 -> 409；并发复核由申请行行锁串行化；
+    - 任一快照已不存在或已撤回 -> 整次批准失败（409），不签发凭证，申请仍可驳回；
+    - 凭证、清单项与申请终态在同一事务提交，任一异常整体回滚。
+    """
+    request = db.execute(
+        select(ReadBundleRequest)
+        .where(ReadBundleRequest.id == request_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    if request.status != BUNDLE_REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "bundle request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own bundle request",
+        )
+
+    snapshot_ids = [UUID(sid) for sid in request.frozen_snapshot_ids]
+    # 批准时重新核对：对全部快照行加锁，任一项失效则整次批准失败、不签发凭证。
+    # FOR UPDATE 与撤回操作串行化；撤回提交后才进入核对的批准必定看到失效项。
+    snapshots = (
+        db.execute(
+            select(Snapshot).where(Snapshot.id.in_(snapshot_ids)).with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    if len(by_id) != len(snapshot_ids) or any(
+        sid not in by_id or by_id[sid].withdrawn_at is not None for sid in snapshot_ids
+    ):
+        # 申请保持 pending：不签发凭证，本次批准失败，但申请仍可被驳回
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="one or more snapshots in the frozen list are no longer available",
+        )
+
+    if request.credential_expires_in_seconds is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=request.credential_expires_in_seconds
+        )
+    else:
+        expires_at = request.credential_expires_at
+    # 一次性签发随机凭证并绑定冻结清单：凭证、清单项与申请终态同事务提交
+    bundle = ReadBundle(
+        credential=secrets.token_urlsafe(32),
+        max_reads=request.max_reads,
+        expires_at=expires_at,
+    )
+    db.add(bundle)
+    db.flush()  # 取得 bundle.id 后写入清单项
+    for position, snapshot_id in enumerate(snapshot_ids):
+        db.add(
+            ReadBundleItem(
+                bundle_id=bundle.id,
+                snapshot_id=snapshot_id,
+                position=position,
+            )
+        )
+    request.status = BUNDLE_REQUEST_APPROVED
+    request.reviewed_by = operator.username
+    request.bundle_id = bundle.id
+    request.credential_expires_at = expires_at
+    request.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    return BundleApproveResponse(
+        request_id=request.id,
+        status=request.status,
+        reviewed_by=operator.username,
+        bundle_id=bundle.id,
+        credential=bundle.credential,
+        snapshot_ids=snapshot_ids,
+        expires_at=expires_at,
+        max_reads=request.max_reads,
+    )
+
+
+@app.post(
+    "/bundle-requests/{request_id}/reject",
+    response_model=BundleRequestInfo,
+)
+def reject_bundle_request(
+    request_id: UUID,
+    payload: ReviewRejectRequest = Body(default_factory=ReviewRejectRequest),
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """驳回共享凭证申请：不签发凭证；驳回是终态，此后不能再批准。"""
+    request = db.execute(
+        select(ReadBundleRequest)
+        .where(ReadBundleRequest.id == request_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    if request.status != BUNDLE_REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "bundle request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own bundle request",
+        )
+    request.status = BUNDLE_REQUEST_REJECTED
+    request.reviewed_by = operator.username
+    request.reason = payload.reason
+    request.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    return _bundle_request_info(request)
+
+
+@app.get(
+    "/bundle-requests/{request_id}",
+    response_model=BundleRequestInfo,
+)
+def get_bundle_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """查看单个共享凭证申请（任何已认证操作者可查；不返回快照原文）。"""
+    request = db.get(ReadBundleRequest, request_id)
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    return _bundle_request_info(request)
+
+
+@app.get(
+    "/bundle-requests",
+    response_model=BundleRequestListResponse,
+)
+def list_bundle_requests(
+    operator: Operator = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """列出全部共享凭证申请（任何已认证操作者可查；只含元数据）。"""
+    requests = (
+        db.execute(
+            select(ReadBundleRequest).order_by(ReadBundleRequest.created_at)
+        )
+        .scalars()
+        .all()
+    )
+    return BundleRequestListResponse(
+        requests=[_bundle_request_info(request) for request in requests]
+    )
+
+
+@app.get(
+    "/read-bundles",
+    response_model=ReadBundleListResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def list_read_bundles(db: Session = Depends(get_db)):
+    """维护侧查询全部共享凭证的清单、额度与状态（绝不返回快照原文）。"""
+    bundles = (
+        db.execute(
+            select(ReadBundle)
+            .options(selectinload(ReadBundle.items))
+            .order_by(ReadBundle.created_at)
+        )
+        .scalars()
+        .all()
+    )
+    snapshots = _load_bundle_snapshots(db, bundles)
+    return ReadBundleListResponse(
+        bundles=[_bundle_status_response(bundle, snapshots) for bundle in bundles]
+    )
+
+
+@app.get(
+    "/read-bundles/{bundle_id}",
+    response_model=ReadBundleStatusResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_read_bundle(bundle_id: UUID, db: Session = Depends(get_db)):
+    """维护侧查询单个共享凭证的清单、额度与状态（绝不返回快照原文）。"""
+    bundle = db.get(ReadBundle, bundle_id)
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="read bundle not found"
+        )
+    snapshots = _load_bundle_snapshots(db, [bundle])
+    return _bundle_status_response(bundle, snapshots)
+
+
+@app.post(
+    "/read-bundles/{bundle_id}/revoke",
+    response_model=BundleRevokeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def revoke_read_bundle(bundle_id: UUID, db: Session = Depends(get_db)):
+    """撤销共享凭证：原子条件 UPDATE，提交后新开始的读取一律拒绝。"""
+    result = db.execute(
+        update(ReadBundle)
+        .where(ReadBundle.id == bundle_id, ReadBundle.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    db.commit()
+    if result.rowcount:
+        return BundleRevokeResponse(
+            bundle_id=bundle_id, revoked=True, already_revoked=False
+        )
+    if db.get(ReadBundle, bundle_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="read bundle not found"
+        )
+    return BundleRevokeResponse(
+        bundle_id=bundle_id, revoked=True, already_revoked=True
+    )
+
+
+def _load_bundle_snapshots(
+    db: Session, bundles: list[ReadBundle]
+) -> dict[UUID, Snapshot]:
+    """批量取清单项引用的快照（维护侧需要其 record/version 与撤回状态）。"""
+    snapshot_ids = {
+        item.snapshot_id
+        for bundle in bundles
+        for item in bundle.items
+    }
+    if not snapshot_ids:
+        return {}
+    snapshots = (
+        db.execute(select(Snapshot).where(Snapshot.id.in_(snapshot_ids)))
+        .scalars()
+        .all()
+    )
+    return {snapshot.id: snapshot for snapshot in snapshots}
+
+
 @app.post(
     "/tokens/{token}/revoke",
     response_model=RevokeResponse,
@@ -757,34 +1154,38 @@ def get_record(record_id: UUID, db: Session = Depends(get_db)):
 @app.get("/public/snapshots/{snapshot_id}", response_model=PublicSnapshotResponse)
 def read_snapshot(
     snapshot_id: UUID,
-    token: str = Query(..., description="发布时签发的读取令牌"),
+    token: str = Query(..., description="发布时签发的读取令牌或共享凭证"),
     db: Session = Depends(get_db),
 ):
-    """公开读取：凭有效令牌返回脱敏正文。
+    """公开读取：凭有效令牌或多快照共享凭证返回脱敏正文。
 
     先对快照行加锁再判定有效性，使读取与永久撤回由数据库行锁串行化：
     撤回提交后才开始的读取在此看到 withdrawn_at 非空，直接返回模糊 403，
-    既不返回正文也不执行计数 UPDATE（不消耗任何令牌的读取次数）。
+    既不返回正文也不执行计数 UPDATE（不消耗任何额度）。
 
-    有效性判定与次数消耗由同一条条件 UPDATE 原子完成：
-    - 令牌不存在、与快照不匹配、已撤销、已到期或已达上限 -> rowcount=0，
-      统一返回模糊的 403，且这些请求不消耗次数；
-    - 撤销/到期优先于剩余次数判断，不能因尚有次数而放行；
-    - 次数判断（reads_used < max_reads）与递增在同一行更新内完成，
-      并发读取由数据库行锁串行化，成功次数绝不超过上限。
+    单快照令牌：有效性判定与次数消耗由同一条条件 UPDATE 原子完成
+    （未撤销、未到期、(不限次或 reads_used < max_reads)）。
+
+    多快照共享凭证：额外要求该快照在凭证绑定清单内，且凭证未撤销、未到期、
+    共享额度未耗尽；计数条件合并在同一条 JOIN 条件 UPDATE 中原子完成：
+    - 凭证不存在、与清单不匹配、快照不在清单内、已撤销、已到期、额度耗尽 -> rowcount=0，
+      统一返回模糊 403，且这些请求不消耗共享额度；
+    - 清单内某项快照后来被撤回：只拒绝该项（快照行锁阶段即 403），不扣额度，
+      其他项仍可凭同一凭证读取；
+    - 到期、撤销或额度耗尽时全部拒绝。
     """
     snapshot = db.execute(
         select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
     ).scalar_one_or_none()
     if snapshot is None or snapshot.withdrawn_at is not None:
-        # 不区分“快照不存在 / 已撤回 / 令牌无效 / 已撤销 / 已过期 / 次数用尽”，
-        # 已撤回时直接拒绝，不触碰读取计数。
+        # 不区分“快照不存在 / 已撤回 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
+        # 快照不存在或已撤回时直接拒绝，不触碰任何读取计数。
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
         )
     now = datetime.now(timezone.utc)
-    # 只有“凭有效令牌成功读取”才计数；上限为 NULL 时继续不限次。
+    # 优先按既有单快照令牌判定（行为与响应完全保持兼容）
     result = db.execute(
         update(ReadToken)
         .where(
@@ -800,9 +1201,30 @@ def read_snapshot(
         .values(reads_used=ReadToken.reads_used + 1)
     )
     if not result.rowcount:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        # 不是有效的单快照令牌：按多快照共享凭证判定（凭证只能读取清单内快照）。
+        # 成员关系、撤销/到期/额度判定与共享计数递增合并为同一条条件 UPDATE，
+        # 命中行即 reads_used = reads_used + 1：行锁串行化并发读取，
+        # 跨清单的成功次数绝不超过共享上限。
+        bundle_result = db.execute(
+            update(ReadBundle)
+            .where(
+                ReadBundle.credential == token,
+                ReadBundle.revoked_at.is_(None),
+                or_(ReadBundle.expires_at.is_(None), ReadBundle.expires_at > now),
+                ReadBundle.reads_used < ReadBundle.max_reads,
+                ReadBundle.id.in_(
+                    select(ReadBundleItem.bundle_id).where(
+                        ReadBundleItem.snapshot_id == snapshot.id
+                    )
+                ),
+            )
+            .values(reads_used=ReadBundle.reads_used + 1)
         )
+        if not bundle_result.rowcount:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+            )
     db.commit()
     return {
         "record_id": snapshot.record_id,

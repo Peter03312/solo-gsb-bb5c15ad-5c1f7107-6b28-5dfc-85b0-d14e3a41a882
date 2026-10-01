@@ -173,3 +173,102 @@ class ApproveResponse(BaseModel):
     expires_at: datetime | None
     # 批准签发令牌的成功读取次数上限；null 表示不限次
     max_reads: int | None = None
+
+
+# ---- 多快照共享凭证（read bundle） ----
+
+
+class BundleRequestCreate(BaseModel):
+    """多快照共享凭证申请：至少两个互不重复的已发布快照 ID + 正整数总额度。"""
+
+    snapshot_ids: list[UUID] = Field(min_length=2)
+    # 全部清单快照共用的成功读取总额度（正整数，必填）
+    max_reads: int = Field(gt=0)
+    # 可选到期策略，二选一；均不填则凭证永不到期
+    expires_in_seconds: int | None = Field(default=None, gt=0)
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _unique_snapshot_ids_and_single_expiry(self):
+        if len(self.snapshot_ids) != len(set(self.snapshot_ids)):
+            raise ValueError("snapshot_ids must not contain duplicates")
+        if self.expires_in_seconds is not None and self.expires_at is not None:
+            raise ValueError("use only one of expires_in_seconds and expires_at")
+        return self
+
+
+class BundleRequestInfo(BaseModel):
+    """共享凭证申请详情：只含元数据，绝不返回快照原文。"""
+
+    request_id: UUID
+    status: str
+    # 冻结的快照清单（提交顺序）
+    snapshot_ids: list[UUID]
+    requested_by: str
+    reviewed_by: str | None
+    reason: str | None
+    credential_expires_in_seconds: int | None
+    credential_expires_at: datetime | None
+    max_reads: int
+    bundle_id: UUID | None
+    created_at: datetime
+    decided_at: datetime | None
+
+
+class BundleRequestListResponse(BaseModel):
+    requests: list[BundleRequestInfo]
+
+
+class BundleSubmitResponse(BaseModel):
+    request_id: UUID
+    status: str
+    snapshot_ids: list[UUID]
+    requested_by: str
+    max_reads: int
+    created_at: datetime
+
+
+class BundleApproveResponse(BaseModel):
+    request_id: UUID
+    status: str
+    reviewed_by: str
+    bundle_id: UUID
+    credential: str
+    snapshot_ids: list[UUID]
+    expires_at: datetime | None
+    max_reads: int
+
+
+class BundleItemInfo(BaseModel):
+    snapshot_id: UUID
+    record_id: UUID
+    version: int
+    position: int
+    # 该快照当前维护状态：published / withdrawn（撤回后只拒绝该项、不扣额度）
+    status: str
+    withdrawn_at: datetime | None = None
+
+
+class ReadBundleStatusResponse(BaseModel):
+    """维护侧凭证状态：清单、额度与状态，绝不返回快照原文。"""
+
+    bundle_id: UUID
+    credential: str
+    max_reads: int
+    reads_used: int
+    remaining_reads: int
+    active: bool
+    created_at: datetime
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    items: list[BundleItemInfo]
+
+
+class ReadBundleListResponse(BaseModel):
+    bundles: list[ReadBundleStatusResponse]
+
+
+class BundleRevokeResponse(BaseModel):
+    bundle_id: UUID
+    revoked: bool
+    already_revoked: bool
