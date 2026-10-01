@@ -165,3 +165,118 @@ class PublishRequest(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ---- 多快照批量凭证（同一外部审阅者） ----
+
+
+class BundleRequest(Base):
+    """多快照批量授权申请：提交时冻结快照清单，另一名 reviewer 复核。
+
+    - pending：待复核，可被批准或驳回
+    - approved / rejected：终态，终态唯一、不可变更
+    快照清单冻结在 bundle_request_items 中；读取总额度（正整数）在提交时冻结，
+    批准后一次性签发绑定清单的批量随机凭证。
+    """
+
+    __tablename__ = "bundle_requests"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'approved', 'rejected')", name="ck_bundle_requests_status"),
+        # 总额度为必填的正整数（批量凭证不允许不限次）
+        CheckConstraint("token_max_reads IS NOT NULL AND token_max_reads > 0", name="ck_bundle_requests_max_reads_positive"),
+        Index("ix_bundle_requests_requested_by", "requested_by", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=REQUEST_PENDING, default=REQUEST_PENDING
+    )
+    requested_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    reviewed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 凭证到期策略（提交时确定）：相对时长在批准签发时才换算成绝对时刻
+    token_expires_in_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 清单内全部快照共用的成功读取总额度（正整数，提交时冻结）
+    token_max_reads: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BundleRequestItem(Base):
+    """批量申请冻结的快照清单条目：按提交顺序保存，批准时原样核对。"""
+
+    __tablename__ = "bundle_request_items"
+    __table_args__ = (
+        # 同一申请内快照不重复；position 唯一决定清单顺序
+        UniqueConstraint("request_id", "snapshot_id", name="uq_bundle_request_items_snapshot"),
+        UniqueConstraint("request_id", "position", name="uq_bundle_request_items_position"),
+    )
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("bundle_requests.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("snapshots.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+
+class BundleToken(Base):
+    """批量读取凭证：一次批准一次性随机签发，绑定冻结快照清单，共用读取额度。
+
+    - max_reads 为必填正整数：清单内所有快照的成功读取合计消耗同一额度；
+    - reads_used 由公开读取接口内的条件 UPDATE 原子递增，并发读取绝不越限；
+    - 到期、撤销或额度耗尽后，清单内全部快照一律拒绝；
+    - 清单中某项快照被撤回，只拒绝该项（公开读取在快照行检查阶段即 403，
+      不触碰本凭证计数），其余项仍可正常读取并共享额度。
+    """
+
+    __tablename__ = "bundle_tokens"
+    __table_args__ = (
+        CheckConstraint("max_reads > 0", name="ck_bundle_tokens_max_reads_positive"),
+        CheckConstraint("reads_used >= 0", name="ck_bundle_tokens_reads_used_non_negative"),
+        CheckConstraint("reads_used <= max_reads", name="ck_bundle_tokens_reads_used_within_limit"),
+    )
+
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 清单共用的成功读取总额度（正整数，必填）
+    max_reads: Mapped[int] = mapped_column(Integer, nullable=False)
+    reads_used: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # 来源申请（一枚凭证只来自一次批准；申请批准后不允许再变更）
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("bundle_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+
+
+class BundleTokenSnapshot(Base):
+    """批量凭证绑定的快照清单：凭证只能读取清单内的脱敏正文。"""
+
+    __tablename__ = "bundle_token_snapshots"
+
+    token: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("bundle_tokens.token", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("snapshots.id", ondelete="CASCADE"),
+        primary_key=True,
+    )

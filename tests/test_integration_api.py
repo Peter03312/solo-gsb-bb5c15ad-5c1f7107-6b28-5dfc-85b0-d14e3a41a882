@@ -1107,5 +1107,486 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
             self.assertEqual(row.withdraw_reason, "误发，撤回")
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class BundleCredentialIntegrationTests(unittest.TestCase):
+    """多快照批量凭证：申请-复核、清单冻结与批准复核、共用额度、撤回隔离。"""
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        # 两条记录、各发布版本 1；再修订记录 A 发布版本 2 —— 共三个已发布快照
+        self.record_a = self._create_record(TEXT_V1, INTERVALS_V1)
+        self.record_b = self._create_record(
+            "患者王五，卡号 6222000000000000。",
+            [{"start": 5, "end": 21}],
+        )
+        self.sid_a1 = self._direct_publish(self.record_a, 1)
+        self.sid_b1 = self._direct_publish(self.record_b, 1)
+        r = self.client.put(
+            f"/records/{self.record_a}",
+            headers=SERVICE_HEADERS,
+            json={"base_version": 1, "text": TEXT_V2, "intervals": [{"start": 9, "end": 15}]},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.sid_a2 = self._direct_publish(self.record_a, 2)
+        self.assertEqual(3, len({self.sid_a1, self.sid_a2, self.sid_b1}))
+
+    # ---- 工具方法 ----
+
+    def _create_record(self, text, intervals):
+        r = self.client.post(
+            "/records", headers=SERVICE_HEADERS, json={"text": text, "intervals": intervals}
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()["record_id"]
+
+    def _direct_publish(self, record_id, version, body_extra=None):
+        body = {"version": version}
+        if body_extra:
+            body.update(body_extra)
+        r = self.client.post(
+            f"/records/{record_id}/publish", headers=SERVICE_HEADERS, json=body
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()["snapshot_id"]
+
+    def _publish_token(self, record_id, version, body_extra=None):
+        body = {"version": version}
+        if body_extra:
+            body.update(body_extra)
+        r = self.client.post(
+            f"/records/{record_id}/publish", headers=SERVICE_HEADERS, json=body
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _submit_bundle(self, snapshot_ids, auth=BASIC_ALICE, extra=None, expected=201):
+        body = {"snapshot_ids": snapshot_ids, "max_reads": 5}
+        if extra:
+            body.update(extra)
+        r = self.client.post("/bundle-requests", auth=auth, json=body)
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _approve_bundle(self, request_id, auth=BASIC_BOB, expected=200):
+        r = self.client.post(f"/bundle-requests/{request_id}/approve", auth=auth)
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _read(self, snapshot_id, token):
+        return self.client.get(f"/public/snapshots/{snapshot_id}?token={token}")
+
+    def _withdraw(self, snapshot_id, reason="批量流程中撤回"):
+        r = self.client.post(
+            f"/snapshots/{snapshot_id}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": reason},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r
+
+    # ---- 提交校验 ----
+
+    def test_submit_requires_at_least_two_distinct_snapshots(self):
+        # 仅一个 -> 422
+        r = self.client.post(
+            "/bundle-requests", auth=BASIC_ALICE, json={"snapshot_ids": [self.sid_a1], "max_reads": 3}
+        )
+        self.assertEqual(r.status_code, 422)
+        # 重复 ID -> 422
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [self.sid_a1, self.sid_a1], "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_submit_requires_positive_integer_max_reads(self):
+        for bad in (None, 0, -1, 1.5):
+            body = {"snapshot_ids": [self.sid_a1, self.sid_b1], "max_reads": bad}
+            r = self.client.post("/bundle-requests", auth=BASIC_ALICE, json=body)
+            self.assertEqual(r.status_code, 422, r.text)
+
+    def test_submit_unknown_snapshot_is_404_and_withdrawn_is_409(self):
+        import uuid
+
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": [self.sid_a1, str(uuid.uuid4())], "max_reads": 3},
+        )
+        self.assertEqual(r.status_code, 404, r.text)
+        self._withdraw(self.sid_b1)
+        r = self._submit_bundle([self.sid_a1, self.sid_b1], expected=409)
+        self.assertNotIn("身份证", r.text)
+
+    def test_submit_roles_and_auth(self):
+        body = {"snapshot_ids": [self.sid_a1, self.sid_b1], "max_reads": 3}
+        # 无凭据
+        self.assertEqual(self.client.post("/bundle-requests", json=body).status_code, 401)
+        # bob 仅 reviewer
+        self.assertEqual(
+            self.client.post("/bundle-requests", auth=BASIC_BOB, json=body).status_code, 403
+        )
+
+    def test_submit_freezes_manifest_in_order(self):
+        ids = [self.sid_b1, self.sid_a1, self.sid_a2]
+        r = self._submit_bundle(ids)
+        body = r.json()
+        self.assertEqual(body["status"], "pending")
+        self.assertEqual(body["requested_by"], "alice")
+        self.assertEqual(body["token_max_reads"], 5)
+        self.assertEqual([s["snapshot_id"] for s in body["snapshots"]], ids)
+        self.assertEqual(
+            [s["status"] for s in body["snapshots"]], ["published"] * 3
+        )
+        # 详情不含正文
+        self.assertNotIn(TEXT_V1, r.text)
+        self.assertNotIn("卡号", r.text)
+
+    # ---- 复核：角色、回避、终态 ----
+
+    def test_review_rules(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        request_id = r.json()["request_id"]
+        # alice 只有 operator，不能批准
+        self.assertEqual(
+            self.client.post(f"/bundle-requests/{request_id}/approve", auth=BASIC_ALICE).status_code,
+            403,
+        )
+        # 无凭据
+        self.assertEqual(
+            self.client.post(f"/bundle-requests/{request_id}/approve").status_code, 401
+        )
+        # carol 是申请人本人（兼具 reviewer）也不得自审
+        r = self._submit_bundle([self.sid_a1, self.sid_b1], auth=BASIC_CAROL)
+        own_id = r.json()["request_id"]
+        self.assertEqual(
+            self.client.post(f"/bundle-requests/{own_id}/approve", auth=BASIC_CAROL).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/bundle-requests/{own_id}/reject", auth=BASIC_CAROL, json={}
+            ).status_code,
+            403,
+        )
+        # 未知申请
+        import uuid
+
+        self.assertEqual(
+            self.client.post(f"/bundle-requests/{uuid.uuid4()}/approve", auth=BASIC_BOB).status_code,
+            404,
+        )
+
+    def test_rejected_request_cannot_be_approved_and_creates_no_credential(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        request_id = r.json()["request_id"]
+        r = self.client.post(
+            f"/bundle-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "范围不符"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+        self.assertEqual(r.json()["reason"], "范围不符")
+        self.assertEqual(self._approve_bundle(request_id, expected=409).status_code, 409)
+        from app.db import SessionLocal
+        from app.models import BundleToken as BundleTokenModel
+
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.query(BundleTokenModel)
+                .filter(BundleTokenModel.request_id == request_id)
+                .count(),
+                0,
+            )
+        # 未签发凭证：任何快照都不能凭猜测的凭证读取
+        self.assertEqual(self._read(self.sid_a1, "anything").status_code, 403)
+
+    def test_approved_request_cannot_be_decided_again(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        request_id = r.json()["request_id"]
+        self._approve_bundle(request_id)
+        self.assertEqual(self._approve_bundle(request_id, expected=409).status_code, 409)
+        self.assertEqual(
+            self.client.post(
+                f"/bundle-requests/{request_id}/reject", auth=BASIC_BOB, json={}
+            ).status_code,
+            409,
+        )
+
+    # ---- 批准时重新核对 ----
+
+    def test_approval_rechecks_snapshots_failure_issues_no_credential(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        request_id = r.json()["request_id"]
+        # 等待期间撤回清单中的一项：整次批准失败（409），不签发凭证
+        self._withdraw(self.sid_b1, reason="复核期间发现问题")
+        r = self._approve_bundle(request_id, expected=409)
+        # 申请仍 pending，仍可驳回
+        r = self.client.get(f"/bundle-requests/{request_id}", auth=BASIC_ALICE)
+        self.assertEqual(r.json()["status"], "pending")
+        r = self.client.post(
+            f"/bundle-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "快照失效"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+        from app.db import SessionLocal
+        from app.models import BundleToken as BundleTokenModel
+
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.query(BundleTokenModel)
+                .filter(BundleTokenModel.request_id == request_id)
+                .count(),
+                0,
+            )
+
+    def test_approval_rechecks_manifest_integrity(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        request_id = r.json()["request_id"]
+        # 模拟冻结清单在待审期间残缺（清单条目丢失、不足两项）：
+        # 批准必须整次失败（409），不能缩水签发
+        from sqlalchemy import text
+
+        from app.db import engine
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM bundle_request_items WHERE request_id = :rid AND position = 1"),
+                {"rid": request_id},
+            )
+        self._approve_bundle(request_id, expected=409)
+        # 申请仍可驳回
+        r = self.client.post(
+            f"/bundle-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "清单不完整"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_successful_approval_issues_one_credential_bound_to_manifest(self):
+        ids = [self.sid_a1, self.sid_b1]
+        r = self._submit_bundle(ids, extra={"expires_in_seconds": 3600})
+        request_id = r.json()["request_id"]
+        r = self._approve_bundle(request_id)
+        body = r.json()
+        self.assertEqual(body["status"], "approved")
+        self.assertEqual(body["reviewed_by"], "bob")
+        self.assertEqual(body["max_reads"], 5)
+        self.assertIsNotNone(body["expires_at"])
+        token = body["token"]
+        self.assertEqual([s["snapshot_id"] for s in body["snapshots"]], ids)
+        # 凭证只能读清单内快照：清单外快照 -> 模糊 403
+        self.assertEqual(self._read(self.sid_a2, token).status_code, 403)
+        # 清单内两项都可读，返回各自脱敏正文，响应结构不变
+        r = self._read(self.sid_a1, token)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            r.json()["redacted_text"],
+            "患者[已遮蔽]，身份证号 [已遮蔽]，联系电话 [已遮蔽]。",
+        )
+        r = self._read(self.sid_b1, token)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("[已遮蔽]", r.json()["redacted_text"])
+
+    # ---- 共用额度 ----
+
+    def test_shared_quota_is_pooled_across_manifest_items(self):
+        r = self._submit_bundle(
+            [self.sid_a1, self.sid_b1, self.sid_a2], extra={"max_reads": 3}
+        )
+        request_id = r.json()["request_id"]
+        token = self._approve_bundle(request_id).json()["token"]
+        # 3 次成功（跨不同清单快照合计）
+        for sid in (self.sid_a1, self.sid_b1, self.sid_a2):
+            self.assertEqual(self._read(sid, token).status_code, 200)
+        # 额度耗尽：清单内全部快照一律 403
+        for sid in (self.sid_a1, self.sid_b1, self.sid_a2):
+            r = self._read(sid, token)
+            self.assertEqual(r.status_code, 403)
+            self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["max_reads"], 3)
+        self.assertEqual(q["reads_used"], 3)
+        self.assertEqual(q["remaining_reads"], 0)
+        self.assertFalse(q["active"])
+        self.assertEqual(len(q["snapshots"]), 3)
+
+    def test_failed_reads_do_not_consume_shared_quota(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1], extra={"max_reads": 3})
+        token = self._approve_bundle(r.json()["request_id"]).json()["token"]
+        # 清单外读取不消耗
+        self.assertEqual(self._read(self.sid_a2, token).status_code, 403)
+        # 无效凭证不消耗
+        self.assertEqual(self._read(self.sid_a1, "not-a-credential").status_code, 403)
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 0)
+        # 一次成功后，清单内某项撤回：只拒绝该项且不扣额度，其他项照读
+        self.assertEqual(self._read(self.sid_a1, token).status_code, 200)
+        self._withdraw(self.sid_b1)
+        r = self._read(self.sid_b1, token)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 1)
+        self.assertEqual(q["remaining_reads"], 2)
+        # 其他项仍可读，占用剩余共享额度
+        self.assertEqual(self._read(self.sid_a1, token).status_code, 200)
+        self.assertEqual(self._read(self.sid_a1, token).status_code, 200)
+        self.assertEqual(self._read(self.sid_a1, token).status_code, 403)
+        # 撤回项维护侧清单状态为 withdrawn，凭证仍 active=False（额度已耗尽）
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS).json()
+        statuses = {s["snapshot_id"]: s["status"] for s in q["snapshots"]}
+        self.assertEqual(statuses[self.sid_b1], "withdrawn")
+        self.assertEqual(statuses[self.sid_a1], "published")
+
+    def test_concurrent_reads_never_exceed_shared_quota(self):
+        r = self._submit_bundle(
+            [self.sid_a1, self.sid_b1, self.sid_a2], extra={"max_reads": 12}
+        )
+        token = self._approve_bundle(r.json()["request_id"]).json()["token"]
+        targets = [self.sid_a1, self.sid_b1, self.sid_a2]
+        successes: list[int] = []
+        failures: list[int] = []
+        barrier = threading.Barrier(24)
+
+        def read_once(index):
+            barrier.wait()
+            client = TestClient(app_main.app)
+            sid = targets[index % 3]
+            code = client.get(f"/public/snapshots/{sid}?token={token}").status_code
+            (successes if code == 200 else failures).append(code)
+
+        threads = [threading.Thread(target=read_once, args=(i,)) for i in range(24)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(successes), 12, successes + failures)
+        self.assertEqual(len(failures), 12)
+        self.assertTrue(all(code == 403 for code in failures))
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 12)
+        self.assertEqual(q["remaining_reads"], 0)
+
+    # ---- 到期、撤销、维护侧 ----
+
+    def test_expiry_denies_all_manifest_items_without_consuming(self):
+        r = self._submit_bundle(
+            [self.sid_a1, self.sid_b1],
+            extra={"max_reads": 5, "expires_in_seconds": 1},
+        )
+        token = self._approve_bundle(r.json()["request_id"]).json()["token"]
+        self.assertEqual(self._read(self.sid_a1, token).status_code, 200)
+        import time as _time
+
+        _time.sleep(1.2)
+        for sid in (self.sid_a1, self.sid_b1):
+            self.assertEqual(self._read(sid, token).status_code, 403)
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 1)
+        self.assertFalse(q["active"])
+        self.assertEqual(q["remaining_reads"], 4)
+
+    def test_past_expires_at_submission_is_422(self):
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={
+                "snapshot_ids": [self.sid_a1, self.sid_b1],
+                "max_reads": 2,
+                "expires_at": "2000-01-01T00:00:00Z",
+            },
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_revocation_denies_all_and_maintenance_endpoints(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        request_id = r.json()["request_id"]
+        token = self._approve_bundle(request_id).json()["token"]
+        # 缺服务密钥
+        self.assertEqual(self.client.get(f"/bundle-tokens/{token}").status_code, 401)
+        self.assertEqual(
+            self.client.post(f"/bundle-tokens/{token}/revoke").status_code, 401
+        )
+        # 未知凭证
+        self.assertEqual(
+            self.client.get("/bundle-tokens/not-real", headers=SERVICE_HEADERS).status_code, 404
+        )
+        # 状态查询
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS)
+        self.assertEqual(q.status_code, 200, q.text)
+        body = q.json()
+        self.assertEqual(body["request_id"], request_id)
+        self.assertTrue(body["active"])
+        self.assertNotIn(TEXT_V1, q.text)
+        # 撤销
+        r = self.client.post(f"/bundle-tokens/{token}/revoke", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["revoked"])
+        # 重复撤销幂等
+        r = self.client.post(f"/bundle-tokens/{token}/revoke", headers=SERVICE_HEADERS)
+        self.assertTrue(r.json()["already_revoked"])
+        # 撤销后清单内全部 403
+        for sid in (self.sid_a1, self.sid_b1):
+            self.assertEqual(self._read(sid, token).status_code, 403)
+        q = self.client.get(f"/bundle-tokens/{token}", headers=SERVICE_HEADERS).json()
+        self.assertFalse(q["active"])
+        self.assertIsNotNone(q["revoked_at"])
+
+    def test_legacy_single_snapshot_tokens_remain_compatible(self):
+        # 既有单快照令牌继续在公开接口按既有规则工作
+        pub = self._publish_token(self.record_a, 1, body_extra={"max_reads": 2})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        for _ in range(2):
+            self.assertEqual(self._read(sid, tok).status_code, 200)
+        self.assertEqual(self._read(sid, tok).status_code, 403)
+        # 单快照令牌只能读自己的快照
+        self.assertEqual(self._read(self.sid_b1, tok).status_code, 403)
+        # 既有令牌状态/撤销接口仍只服务单快照令牌（批量凭证不在该命名空间）
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS)
+        self.assertEqual(q.status_code, 200)
+        self.assertEqual(q.json()["reads_used"], 2)
+
+    def test_bundle_credential_does_not_work_on_legacy_token_status_endpoint(self):
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        token = self._approve_bundle(r.json()["request_id"]).json()["token"]
+        self.assertEqual(
+            self.client.get(f"/tokens/{token}", headers=SERVICE_HEADERS).status_code, 404
+        )
+        self.assertEqual(
+            self.client.post(f"/tokens/{token}/revoke", headers=SERVICE_HEADERS).status_code,
+            404,
+        )
+
+    def test_approval_failure_rolls_back_credential(self):
+        """批准事务在凭证写入阶段失败时，不留凭证、申请仍 pending。"""
+        from unittest import mock
+
+        r = self._submit_bundle([self.sid_a1, self.sid_b1])
+        request_id = r.json()["request_id"]
+        with mock.patch.object(
+            app_main.secrets, "token_urlsafe", return_value="x" * 65
+        ):
+            with self.assertRaises(Exception):
+                self.client.post(f"/bundle-requests/{request_id}/approve", auth=BASIC_BOB)
+        r = self.client.get(f"/bundle-requests/{request_id}", auth=BASIC_ALICE)
+        self.assertEqual(r.json()["status"], "pending")
+        # 之后仍可正常批准
+        self.assertEqual(self._approve_bundle(request_id).status_code, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

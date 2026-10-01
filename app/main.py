@@ -21,10 +21,20 @@ from .models import (
     Record,
     RecordVersion,
     Snapshot,
+    BundleRequest,
+    BundleRequestItem,
+    BundleToken,
+    BundleTokenSnapshot,
 )
 from .redaction import IntervalOutOfBoundsError, redact_text, validate_intervals
 from .schemas import (
     ApproveResponse,
+    BundleApproveResponse,
+    BundleRequestInfo,
+    BundleRequestSnapshotInfo,
+    BundleSubmitRequest,
+    BundleTokenSnapshotStatus,
+    BundleTokenStatusResponse,
     ControlledFlagResponse,
     ControlledPublishRequest,
     ControlledSubmitResponse,
@@ -137,8 +147,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.3.0",
-    summary="机构公开脱敏记录服务（受控发布申请-复核 + 读取次数上限 + 快照永久撤回）",
+    version="1.4.0",
+    summary="机构公开脱敏记录服务（受控发布申请-复核 + 读取次数上限 + 快照永久撤回 + 多快照批量凭证）",
     lifespan=lifespan,
 )
 
@@ -207,6 +217,82 @@ def _validate_expiry_policy(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="expires_at must be in the future",
         )
+
+
+def _load_ordered_snapshots(
+    db: Session, snapshot_ids: list[UUID]
+) -> dict[UUID, Snapshot]:
+    """按 ID 批量取快照，返回以 ID 为键的映射（不存在的 ID 不在映射中）。"""
+    if not snapshot_ids:
+        return {}
+    rows = db.execute(select(Snapshot).where(Snapshot.id.in_(snapshot_ids))).scalars().all()
+    return {row.id: row for row in rows}
+
+
+def _ensure_all_published(snapshot_ids: list[UUID], snapshots: dict[UUID, Snapshot]) -> None:
+    """核对清单内快照全部存在且未撤回：
+
+    - 任一 ID 不存在 -> 404（整次失败，绝不部分成功）；
+    - 任一已撤回 -> 409（提交时/批准时同一口径）。
+    """
+    missing = [sid for sid in snapshot_ids if sid not in snapshots]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="one or more snapshots not found"
+        )
+    if any(snapshots[sid].withdrawn_at is not None for sid in snapshot_ids):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="one or more snapshots have been withdrawn",
+        )
+
+
+def _bundle_snapshot_infos(
+    positions: list[tuple[int, UUID]], snapshots: dict[UUID, Snapshot]
+) -> list[BundleRequestSnapshotInfo]:
+    """按冻结顺序构造清单条目；快照缺失时只回 ID 与序号（其余元数据为 null）。"""
+    infos: list[BundleRequestSnapshotInfo] = []
+    for position, snapshot_id in positions:
+        snapshot = snapshots.get(snapshot_id)
+        infos.append(
+            BundleRequestSnapshotInfo(
+                position=position,
+                snapshot_id=snapshot_id,
+                record_id=None if snapshot is None else snapshot.record_id,
+                version=None if snapshot is None else snapshot.version,
+                status=None if snapshot is None else _snapshot_status(snapshot),
+                withdrawn_at=None if snapshot is None else snapshot.withdrawn_at,
+            )
+        )
+    return infos
+
+
+def _bundle_request_info(db: Session, request: BundleRequest) -> BundleRequestInfo:
+    """批量申请详情映射：只输出元数据与清单，凭证与正文绝不离开服务端。"""
+    items = (
+        db.execute(
+            select(BundleRequestItem)
+            .where(BundleRequestItem.request_id == request.id)
+            .order_by(BundleRequestItem.position)
+        )
+        .scalars()
+        .all()
+    )
+    positions = [(item.position, item.snapshot_id) for item in items]
+    snapshots = _load_ordered_snapshots(db, [snapshot_id for _, snapshot_id in positions])
+    return BundleRequestInfo(
+        request_id=request.id,
+        status=request.status,
+        requested_by=request.requested_by,
+        reviewed_by=request.reviewed_by,
+        reason=request.reason,
+        token_expires_in_seconds=request.token_expires_in_seconds,
+        token_expires_at=request.token_expires_at,
+        token_max_reads=request.token_max_reads,
+        snapshots=_bundle_snapshot_infos(positions, snapshots),
+        created_at=request.created_at,
+        decided_at=request.decided_at,
+    )
 
 
 @app.get("/healthz")
@@ -570,6 +656,300 @@ def reject_publish_request(
     return _request_info(request)
 
 
+@app.post(
+    "/bundle-requests",
+    status_code=status.HTTP_201_CREATED,
+    response_model=BundleRequestInfo,
+)
+def submit_bundle_request(
+    payload: BundleSubmitRequest,
+    operator: Operator = Depends(require_role("operator")),
+    db: Session = Depends(get_db),
+):
+    """提交多快照批量授权申请：冻结清单与共用读取总额度。
+
+    至少两个互不重复的快照 ID（清单内去重在 schema 层校验，重复/不足 -> 422）；
+    提交时全部快照必须存在（否则 404）且未撤回（否则 409）。
+    到期策略与既有令牌一致（相对时长在批准签发时换算）；max_reads 为必填正整数。
+    """
+    snapshot_ids = list(payload.snapshot_ids)
+    _validate_expiry_policy(payload.expires_in_seconds, payload.expires_at)
+    expires_at = payload.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    snapshots = _load_ordered_snapshots(db, snapshot_ids)
+    _ensure_all_published(snapshot_ids, snapshots)
+    # 清单在此冻结：后续撤回单个快照不改变清单本身，只在批准时重新核对/读取时拒绝该项
+    request = BundleRequest(
+        status=REQUEST_PENDING,
+        requested_by=operator.username,
+        token_expires_in_seconds=payload.expires_in_seconds,
+        token_expires_at=expires_at,
+        token_max_reads=payload.max_reads,
+    )
+    db.add(request)
+    db.flush()  # 取得 request.id 后写清单
+    for position, snapshot_id in enumerate(snapshot_ids):
+        db.add(
+            BundleRequestItem(
+                request_id=request.id, position=position, snapshot_id=snapshot_id
+            )
+        )
+    db.commit()
+    return _bundle_request_info(db, request)
+
+
+@app.post(
+    "/bundle-requests/{request_id}/approve",
+    response_model=BundleApproveResponse,
+)
+def approve_bundle_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """批准批量申请：重新核对清单内全部快照仍存在且未撤回。
+
+    任一项失效（不存在/已撤回）则整次批准失败：不签发凭证，返回 404/409，
+    申请仍可驳回。全部有效时，凭证、清单绑定与申请终态在同一事务提交。
+    """
+    # 锁申请行：与并发复核串行化，保证同一申请只有一个终态
+    request = db.execute(
+        select(BundleRequest).where(BundleRequest.id == request_id).with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    if request.status != REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "bundle request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own bundle request",
+        )
+
+    items = (
+        db.execute(
+            select(BundleRequestItem)
+            .where(BundleRequestItem.request_id == request.id)
+            .order_by(BundleRequestItem.position)
+        )
+        .scalars()
+        .all()
+    )
+    snapshot_ids = [item.snapshot_id for item in items]
+    # 清单完整性：冻结条目不得少于两项（与提交口径一致），防止部分失效后缩水签发。
+    if len(snapshot_ids) < 2:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="bundle manifest is no longer intact",
+        )
+    # 批准时重新核对：以快照行锁取清单，与撤回操作串行化；
+    # 任一项不存在或已撤回，整次批准失败（回滚，不签发凭证），申请仍可驳回。
+    locked_rows = (
+        db.execute(
+            select(Snapshot)
+            .where(Snapshot.id.in_(snapshot_ids))
+            .with_for_update()
+            .order_by(Snapshot.id)
+        )
+        .scalars()
+        .all()
+    )
+    snapshots = {row.id: row for row in locked_rows}
+    _ensure_all_published(snapshot_ids, snapshots)
+
+    if request.token_expires_in_seconds is not None:
+        token_expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=request.token_expires_in_seconds
+        )
+    else:
+        token_expires_at = request.token_expires_at
+    # 显式绝对到期时刻若在复核期间已过，不签发注定无效的凭证：整次批准失败，仍可驳回
+    if token_expires_at is not None and token_expires_at <= datetime.now(timezone.utc):
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="chosen expiry time has already passed",
+        )
+    token_value = secrets.token_urlsafe(32)
+    bundle_token = BundleToken(
+        token=token_value,
+        expires_at=token_expires_at,
+        max_reads=request.token_max_reads,
+        request_id=request.id,
+    )
+    db.add(bundle_token)
+    db.flush()  # 凭证落库后再绑定清单
+    for snapshot_id in snapshot_ids:
+        db.add(BundleTokenSnapshot(token=token_value, snapshot_id=snapshot_id))
+    request.status = REQUEST_APPROVED
+    request.reviewed_by = operator.username
+    request.token_expires_at = token_expires_at
+    request.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    positions = [(item.position, item.snapshot_id) for item in items]
+    return BundleApproveResponse(
+        request_id=request.id,
+        status=request.status,
+        reviewed_by=operator.username,
+        snapshots=_bundle_snapshot_infos(positions, snapshots),
+        token=token_value,
+        expires_at=token_expires_at,
+        max_reads=request.token_max_reads,
+    )
+
+
+@app.post(
+    "/bundle-requests/{request_id}/reject",
+    response_model=BundleRequestInfo,
+)
+def reject_bundle_request(
+    request_id: UUID,
+    payload: ReviewRejectRequest = Body(default_factory=ReviewRejectRequest),
+    operator: Operator = Depends(require_role("reviewer")),
+    db: Session = Depends(get_db),
+):
+    """驳回批量申请：不签发凭证；驳回是终态，此后不能再批准。"""
+    request = db.execute(
+        select(BundleRequest).where(BundleRequest.id == request_id).with_for_update()
+    ).scalar_one_or_none()
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    if request.status != REQUEST_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "bundle request already decided",
+                "status": request.status,
+            },
+        )
+    if request.requested_by == operator.username:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="the requester may not review their own bundle request",
+        )
+    request.status = REQUEST_REJECTED
+    request.reviewed_by = operator.username
+    request.reason = payload.reason
+    request.decided_at = datetime.now(timezone.utc)
+    db.commit()
+    return _bundle_request_info(db, request)
+
+
+@app.get(
+    "/bundle-requests/{request_id}",
+    response_model=BundleRequestInfo,
+)
+def get_bundle_request(
+    request_id: UUID,
+    operator: Operator = Depends(require_operator),
+    db: Session = Depends(get_db),
+):
+    """查看单个批量申请状态（任何已认证操作者可查；不返回凭证与正文）。"""
+    request = db.get(BundleRequest, request_id)
+    if request is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle request not found"
+        )
+    return _bundle_request_info(db, request)
+
+
+@app.get(
+    "/bundle-tokens/{token}",
+    response_model=BundleTokenStatusResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_bundle_token_status(token: str, db: Session = Depends(get_db)):
+    """维护侧查询批量凭证：清单、共用额度、已用/剩余与有效性（绝不返回正文）。"""
+    bundle_token = db.get(BundleToken, token)
+    if bundle_token is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle token not found"
+        )
+    links = (
+        db.execute(
+            select(BundleTokenSnapshot)
+            .where(BundleTokenSnapshot.token == token)
+        )
+        .scalars()
+        .all()
+    )
+    linked_ids = {link.snapshot_id for link in links}
+    # 清单顺序以申请冻结顺序为准
+    items = (
+        db.execute(
+            select(BundleRequestItem)
+            .where(BundleRequestItem.request_id == bundle_token.request_id)
+            .order_by(BundleRequestItem.position)
+        )
+        .scalars()
+        .all()
+    )
+    ordered_ids = [item.snapshot_id for item in items if item.snapshot_id in linked_ids]
+    # 防御：若出现冻结清单之外的绑定，仍如实列出（不应发生）
+    ordered_ids.extend(sid for sid in linked_ids if sid not in ordered_ids)
+    snapshots = _load_ordered_snapshots(db, ordered_ids)
+    now = datetime.now(timezone.utc)
+    expired = bundle_token.expires_at is not None and bundle_token.expires_at <= now
+    exhausted = bundle_token.reads_used >= bundle_token.max_reads
+    snapshot_infos = [
+        BundleTokenSnapshotStatus(
+            position=index,
+            snapshot_id=snapshot_id,
+            record_id=None if (snapshot := snapshots.get(snapshot_id)) is None else snapshot.record_id,
+            version=None if snapshot is None else snapshot.version,
+            status=None if snapshot is None else _snapshot_status(snapshot),
+            withdrawn_at=None if snapshot is None else snapshot.withdrawn_at,
+        )
+        for index, snapshot_id in enumerate(ordered_ids)
+    ]
+    return BundleTokenStatusResponse(
+        token=bundle_token.token,
+        request_id=bundle_token.request_id,
+        created_at=bundle_token.created_at,
+        expires_at=bundle_token.expires_at,
+        revoked_at=bundle_token.revoked_at,
+        max_reads=bundle_token.max_reads,
+        reads_used=bundle_token.reads_used,
+        remaining_reads=max(bundle_token.max_reads - bundle_token.reads_used, 0),
+        active=bundle_token.revoked_at is None and not expired and not exhausted,
+        snapshots=snapshot_infos,
+    )
+
+
+@app.post(
+    "/bundle-tokens/{token}/revoke",
+    response_model=RevokeResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def revoke_bundle_token(token: str, db: Session = Depends(get_db)):
+    """撤销批量凭证：单条原子 UPDATE，提交后清单内全部快照的新读取一律拒绝。"""
+    result = db.execute(
+        update(BundleToken)
+        .where(BundleToken.token == token, BundleToken.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    db.commit()
+    if result.rowcount:
+        return RevokeResponse(token=token, revoked=True, already_revoked=False)
+    if db.get(BundleToken, token) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="bundle token not found"
+        )
+    return RevokeResponse(token=token, revoked=True, already_revoked=True)
+
+
 @app.get(
     "/publish-requests/{request_id}",
     response_model=PublishRequestInfo,
@@ -757,34 +1137,36 @@ def get_record(record_id: UUID, db: Session = Depends(get_db)):
 @app.get("/public/snapshots/{snapshot_id}", response_model=PublicSnapshotResponse)
 def read_snapshot(
     snapshot_id: UUID,
-    token: str = Query(..., description="发布时签发的读取令牌"),
+    token: str = Query(..., description="发布时签发的读取令牌，或批准批量申请签发的凭证"),
     db: Session = Depends(get_db),
 ):
-    """公开读取：凭有效令牌返回脱敏正文。
+    """公开读取：凭有效单快照令牌或批量凭证返回脱敏正文。
 
     先对快照行加锁再判定有效性，使读取与永久撤回由数据库行锁串行化：
     撤回提交后才开始的读取在此看到 withdrawn_at 非空，直接返回模糊 403，
-    既不返回正文也不执行计数 UPDATE（不消耗任何令牌的读取次数）。
+    既不返回正文也不执行任何计数 UPDATE（批量凭证不消耗共享额度；
+    因此清单中某项撤回只拒绝该项，其他项仍可读、共享额度不变）。
 
     有效性判定与次数消耗由同一条条件 UPDATE 原子完成：
-    - 令牌不存在、与快照不匹配、已撤销、已到期或已达上限 -> rowcount=0，
-      统一返回模糊的 403，且这些请求不消耗次数；
-    - 撤销/到期优先于剩余次数判断，不能因尚有次数而放行；
-    - 次数判断（reads_used < max_reads）与递增在同一行更新内完成，
-      并发读取由数据库行锁串行化，成功次数绝不超过上限。
+    - 单快照令牌：令牌不存在、与快照不匹配、已撤销、已到期或已达上限 -> rowcount=0；
+    - 批量凭证：凭证须未撤销、未到期、共享额度未耗尽，且该快照在绑定清单内
+      （EXISTS 子查询）；清单外快照、到期/撤销/额度耗尽 -> rowcount=0；
+    - 两者都未命中时统一返回模糊 403，且这些请求不消耗任何次数；
+    - 批量凭证的计数行是凭证本身：清单内全部快照的成功读取串行化在同一行，
+      共用同一 reads_used，并发读取的合计成功次数绝不超过上限。
     """
     snapshot = db.execute(
         select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
     ).scalar_one_or_none()
     if snapshot is None or snapshot.withdrawn_at is not None:
-        # 不区分“快照不存在 / 已撤回 / 令牌无效 / 已撤销 / 已过期 / 次数用尽”，
-        # 已撤回时直接拒绝，不触碰读取计数。
+        # 不区分“快照不存在 / 已撤回 / 令牌无效 / 已撤销 / 已过期 / 次数用尽 /
+        # 不在批量清单内”，已撤回时直接拒绝，不触碰任何读取计数。
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
         )
     now = datetime.now(timezone.utc)
-    # 只有“凭有效令牌成功读取”才计数；上限为 NULL 时继续不限次。
+    # 只有“凭有效令牌/凭证成功读取”才计数；上限为 NULL 时单快照令牌继续不限次。
     result = db.execute(
         update(ReadToken)
         .where(
@@ -800,9 +1182,28 @@ def read_snapshot(
         .values(reads_used=ReadToken.reads_used + 1)
     )
     if not result.rowcount:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        # 单快照令牌未命中：尝试批量凭证（清单绑定 + 共享额度在同一条
+        # 条件 UPDATE 内判定并递增；行锁串行化清单内的并发读取）。
+        bundle_result = db.execute(
+            update(BundleToken)
+            .where(
+                BundleToken.token == token,
+                BundleToken.revoked_at.is_(None),
+                or_(BundleToken.expires_at.is_(None), BundleToken.expires_at > now),
+                BundleToken.reads_used < BundleToken.max_reads,
+                select(BundleTokenSnapshot.snapshot_id)
+                .where(
+                    BundleTokenSnapshot.token == BundleToken.token,
+                    BundleTokenSnapshot.snapshot_id == snapshot.id,
+                )
+                .exists(),
+            )
+            .values(reads_used=BundleToken.reads_used + 1)
         )
+        if not bundle_result.rowcount:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+            )
     db.commit()
     return {
         "record_id": snapshot.record_id,
